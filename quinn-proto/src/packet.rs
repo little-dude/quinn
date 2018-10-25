@@ -5,6 +5,7 @@ use rand::Rng;
 use slog;
 
 use coding::{self, BufExt, BufMutExt};
+use crypto::PacketNumberKey;
 use {LOCAL_ID_LEN, MAX_CID_SIZE, MIN_CID_SIZE, VERSION};
 
 // Due to packet number encryption, it is impossible to fully decode a header
@@ -56,7 +57,7 @@ impl PartialDecode {
         self.invariant_header.dst_cid()
     }
 
-    pub fn finish(self) -> Result<(Packet, Option<BytesMut>), PacketDecodeError> {
+    pub fn finish(self, pn_key: &PacketNumberKey) -> Result<(Packet, Option<BytesMut>), PacketDecodeError> {
         let Self {
             invariant_header,
             mut buf,
@@ -64,6 +65,23 @@ impl PartialDecode {
         let (payload_len, header, allow_coalesced) = match invariant_header {
             InvariantHeader::Short { first, dst_cid } => {
                 let key_phase = first & KEY_PHASE_BIT != 0;
+                if buf.remaining() < 1 {
+                    return Err(HeaderError::InvalidHeader("cannot read packet number"));
+                }
+
+                let sample_offset = 1 + dst_cid.len() + 4;
+                let packet_length = buf.get_ref().len();
+                if sample_offset + crypto.sample_length() > packet_length {
+                    sample_offset = packet_length - crypto.sample_length();
+                }
+
+                let sample = &buf.get_ref()[sample_offset..sample_offset + crypto.sample_length()];
+                let number_bytes = [0u8; 4];
+                let number = Self::decode_packet_number(pn_key, sample, &mut number_bytes);
+                number_bytes[0] = buf.bytes()[0];
+                
+                pn_key.decrypt(sample, &mut number_bytes[..1]);
+
                 let number = match first & 0b11 {
                     0x0 => PacketNumber::U8(buf.get()?),
                     0x1 => PacketNumber::U16(buf.get()?),
@@ -121,6 +139,9 @@ impl PartialDecode {
                         buf.copy_to_slice(&mut token);
 
                         let len = buf.get_var()?;
+                        let sample_offset = 10 + dst_cid.len() + src_cid.len() + varint::size(len) +
+                            varint::size(token_length) + token.len();
+
                         let number = buf.get()?;
                         (
                             len as usize,
@@ -135,6 +156,8 @@ impl PartialDecode {
                     }
                     ty @ LongType::Handshake | ty @ LongType::ZeroRtt => {
                         let len = buf.get_var()?;
+                        let sample_offset = 10 + dst_cid.len() + src_cid.len() + varint::size(len);
+
                         let number = buf.get()?;
                         (
                             len as usize,
