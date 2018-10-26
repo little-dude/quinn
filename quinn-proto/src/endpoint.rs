@@ -12,10 +12,10 @@ use slog::{self, Logger};
 
 use coding::BufMutExt;
 use connection::{
-    state, Connection, ConnectionConfig, ConnectionError, ConnectionHandle, ReadError, State,
+    make_tls, state, ClientConfig, Connection, ConnectionError, ConnectionHandle, ReadError, State,
     WriteError,
 };
-use crypto::{self, reset_token_for, ClientConfig, ConnectError, Crypto, ServerConfig};
+use crypto::{self, reset_token_for, ConnectError, Crypto, ServerConfig};
 use packet::{
     set_payload_length, types, ConnectionId, Header, HeaderError, Packet, PacketNumber,
     AEAD_TAG_SIZE,
@@ -465,7 +465,7 @@ impl Endpoint {
     pub fn connect(
         &mut self,
         remote: SocketAddrV6,
-        config: &Arc<ClientConfig>,
+        config: &Arc<crypto::ClientConfig>,
         server_name: &str,
     ) -> Result<ConnectionHandle, ConnectError> {
         let local_id = ConnectionId::random(&mut self.ctx.rng, LOCAL_ID_LEN as u8);
@@ -476,10 +476,10 @@ impl Endpoint {
             local_id,
             remote_id,
             remote,
-            ConnectionConfig::Client {
-                config,
-                server_name,
-            },
+            Some(ClientConfig {
+                tls_config: config.clone(),
+                server_name: server_name.into(),
+            }),
         );
         self.ctx.dirty_conns.insert(conn);
         Ok(conn)
@@ -491,20 +491,23 @@ impl Endpoint {
         local_id: ConnectionId,
         remote_id: ConnectionId,
         remote: SocketAddrV6,
-        conn_config: ConnectionConfig,
+        client_config: Option<ClientConfig>,
     ) -> ConnectionHandle {
         debug_assert!(!local_id.is_empty());
         let packet_num = self.ctx.gen_initial_packet_num();
         let conn = {
             let entry = self.connections.vacant_entry();
             let conn = ConnectionHandle(entry.key());
+            let tls = make_tls(&self.ctx, &local_id, client_config.as_ref());
+
             entry.insert(Connection::new(
                 initial_id,
                 local_id,
                 remote_id,
                 remote,
                 packet_num.into(),
-                conn_config,
+                client_config,
+                tls,
                 &mut self.ctx,
                 conn,
             ));
@@ -557,13 +560,7 @@ impl Endpoint {
             return;
         }
 
-        let conn = self.add_connection(
-            dest_id,
-            local_id,
-            source_id,
-            remote,
-            ConnectionConfig::Server,
-        );
+        let conn = self.add_connection(dest_id, local_id, source_id, remote, None);
         self.connection_ids_initial.insert(dest_id, conn);
         match self.connections[conn.0].handle_initial(
             &mut self.ctx,

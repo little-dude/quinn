@@ -9,7 +9,7 @@ use rand::distributions::Distribution;
 use slog::Logger;
 
 use coding::{BufExt, BufMutExt};
-use crypto::{reset_token_for, ClientConfig, Crypto, TLSError, TlsSession, ACK_DELAY_EXPONENT};
+use crypto::{self, reset_token_for, Crypto, TLSError, TlsSession, ACK_DELAY_EXPONENT};
 use endpoint::{Config, Context, Event, Io, Timer};
 use packet::{
     set_payload_length, types, ConnectionId, Header, Packet, PacketNumber, AEAD_TAG_SIZE,
@@ -61,8 +61,7 @@ pub struct Connection {
     pub data_recvd: u64,
     /// Limit on incoming data
     pub local_max_data: u64,
-    /// Server name (for client-side)
-    pub server_name: Option<String>,
+    client_config: Option<ClientConfig>,
 
     //
     // Loss Detection
@@ -156,7 +155,39 @@ pub struct Connection {
     pub max_remote_uni_streams: u64,
     pub max_remote_bi_streams: u64,
     pub finished_streams: Vec<StreamId>,
-    pub tls_client_config: Option<Arc<ClientConfig>>,
+}
+
+#[derive(Clone)]
+pub struct ClientConfig {
+    pub server_name: String,
+    pub tls_config: Arc<crypto::ClientConfig>,
+}
+
+pub fn make_tls(
+    ctx: &Context,
+    local_id: &ConnectionId,
+    config: Option<&ClientConfig>,
+) -> TlsSession {
+    match config {
+        Some(&ClientConfig {
+            ref tls_config,
+            ref server_name,
+        }) => TlsSession::new_client(
+            tls_config,
+            server_name,
+            &TransportParameters::new(&ctx.config),
+        ).unwrap(),
+        None => {
+            let server_params = TransportParameters {
+                stateless_reset_token: Some(reset_token_for(
+                    &ctx.listen_keys.as_ref().unwrap().reset,
+                    &local_id,
+                )),
+                ..TransportParameters::new(&ctx.config)
+            };
+            TlsSession::new_server(&ctx.config.tls_server_config, &server_params)
+        }
+    }
 }
 
 /// Represents one or more packets subject to retransmission
@@ -274,11 +305,16 @@ impl Connection {
         remote_id: ConnectionId,
         remote: SocketAddrV6,
         initial_packet_number: u64,
-        conn_config: ConnectionConfig,
+        client_config: Option<ClientConfig>,
+        tls: TlsSession,
         ctx: &mut Context,
         handle: ConnectionHandle,
     ) -> Self {
-        let side = conn_config.side();
+        let side = if client_config.is_some() {
+            Side::Client
+        } else {
+            Side::Server
+        };
         let handshake_crypto = Crypto::new_handshake(&initial_id, side);
         let mut streams = FnvHashMap::default();
         for i in 0..ctx.config.max_remote_uni_streams {
@@ -305,35 +341,8 @@ impl Connection {
                 Stream::new_bi(ctx.config.stream_receive_window as u64),
             );
         }
-        let (tls, tls_client_config) = match conn_config {
-            ConnectionConfig::Client {
-                config: client_config,
-                server_name,
-            } => (
-                TlsSession::new_client(
-                    client_config,
-                    server_name,
-                    &TransportParameters::new(&ctx.config),
-                ).unwrap(),
-                Some(client_config.clone()),
-            ),
-            ConnectionConfig::Server => {
-                let server_params = TransportParameters {
-                    stateless_reset_token: Some(reset_token_for(
-                        &ctx.listen_keys.as_ref().unwrap().reset,
-                        &local_id,
-                    )),
-                    ..TransportParameters::new(&ctx.config)
-                };
-                (
-                    TlsSession::new_server(&ctx.config.tls_server_config, &server_params),
-                    None,
-                )
-            }
-        };
         let mut this = Self {
             tls,
-            tls_client_config,
             app_closed: false,
             initial_id,
             local_id,
@@ -356,10 +365,7 @@ impl Connection {
             data_sent: 0,
             data_recvd: 0,
             local_max_data: ctx.config.receive_window as u64,
-            server_name: match conn_config {
-                ConnectionConfig::Client { server_name, .. } => Some(server_name.into()),
-                _ => None,
-            },
+            client_config,
 
             handshake_count: 0,
             tlp_count: 0,
@@ -999,6 +1005,9 @@ impl Connection {
                                     // Send updated ClientHello
                                     let mut outgoing = Vec::new();
                                     self.tls.write_tls(&mut outgoing).unwrap();
+                                    let tls =
+                                        make_tls(&ctx, &self.local_id, self.client_config.as_ref());
+
                                     // Discard transport state
                                     let mut new = Connection::new(
                                         remote_id,
@@ -1006,14 +1015,8 @@ impl Connection {
                                         remote_id,
                                         remote,
                                         ctx.initial_packet_number.sample(&mut ctx.rng),
-                                        ConnectionConfig::Client {
-                                            server_name: self
-                                                .server_name
-                                                .as_ref()
-                                                .map(|x| &x[..])
-                                                .unwrap(),
-                                            config: self.tls_client_config.as_ref().unwrap(),
-                                        },
+                                        self.client_config.clone(),
+                                        tls,
                                         ctx,
                                         self.handle,
                                     );
@@ -2372,23 +2375,6 @@ impl Connection {
         let n = conn_budget.min(stream_budget).min(data.len() as u64) as usize;
         self.transmit(stream, (&data[0..n]).into());
         Ok(n)
-    }
-}
-
-pub enum ConnectionConfig<'a> {
-    Client {
-        config: &'a Arc<ClientConfig>,
-        server_name: &'a str,
-    },
-    Server,
-}
-
-impl<'a> ConnectionConfig<'a> {
-    pub fn side(&self) -> Side {
-        match *self {
-            ConnectionConfig::Client { .. } => Side::Client,
-            ConnectionConfig::Server => Side::Server,
-        }
     }
 }
 
